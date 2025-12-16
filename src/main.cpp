@@ -105,11 +105,105 @@ private:
   static void register_custom_characters();
 };
 
+#pragma once
+
+#include <stdint.h>
+
+class PinManager
+{
+private:
+  const uint8_t pin_;
+  volatile uint8_t *const port_input_reg_;
+  volatile uint8_t *const port_data_reg_;
+  volatile uint8_t *const data_dir_reg_;
+
+public:
+  enum DataDirection
+  {
+    Input = false,
+    Output = true,
+  };
+
+  PinManager(uint8_t pin, volatile uint8_t *port_input_reg,
+             volatile uint8_t *port_data_reg, volatile uint8_t *data_dir_reg)
+      : pin_(pin), port_input_reg_(port_input_reg),
+        port_data_reg_(port_data_reg), data_dir_reg_(data_dir_reg)
+  {
+  }
+
+  bool get_digital_level() const
+  {
+    return get_bit(*this->port_input_reg_, this->pin_) != 0;
+  }
+
+  void set_digital_level(bool digital_level) const
+  {
+    digital_level ? set_bit(*this->port_data_reg_, this->pin_)
+                  : reset_bit(*this->port_data_reg_, this->pin_);
+  }
+
+  void set_data_direction(DataDirection direction) const
+  {
+    direction ? set_bit(*this->data_dir_reg_, this->pin_)
+              : reset_bit(*this->data_dir_reg_, this->pin_);
+  }
+};
+
+class Button
+{
+private:
+  const PinManager pin_manager;
+  // Inicializa ambos como não pressionados.
+  // Lembre-se que os botões, quando pressionados, ficam no estado
+  // lógico/digital `LOW` (`false`).
+  bool previous_state = true;
+  bool current_state = true;
+
+public:
+  Button(PinManager pin_manager) : pin_manager(pin_manager) {}
+  /**
+   * Estado de tempo utilizando pra aplicar o debounce em cada botão
+   */
+  unsigned long time_state = 0;
+  bool has_changed() const
+  {
+    return this->current_state != this->previous_state;
+  }
+  /**
+   * Se, e somente se, `has_changed() == true`, este método retorna:
+   * - `true` se o botão foi pressionado;
+   * - `false` se o botão foi solto.
+   *
+   * Caso contrário, o resultado desta função não tem significado.
+   */
+  bool has_been_pressed() const { return !this->current_state; }
+  /**
+   * Checa o nível digital do botão para descobrir se houve interação.
+   */
+  void check()
+  {
+    this->previous_state = this->current_state;
+    this->current_state = this->pin_manager.get_digital_level();
+  }
+
+  void setup()
+  {
+    this->pin_manager.set_data_direction(PinManager::Input);
+    // ativa o registor pull-up
+    this->pin_manager.set_digital_level(true);
+  }
+};
+
 #pragma endregion
 #pragma region global vars & configs
 
 #pragma endregion
 #pragma region main
+
+auto power_btn = Button(PinManager(PC2, &PINC, &PORTC, &DDRC));
+auto configuration_btn = Button(PinManager(PC3, &PINC, &PORTC, &DDRC));
+auto increment_btn = Button(PinManager(PC4, &PINC, &PORTC, &DDRC));
+auto decrement_btn = Button(PinManager(PC5, &PINC, &PORTC, &DDRC));
 
 void setup()
 {
@@ -123,9 +217,64 @@ void setup()
   // nulo das strings em C, então o truque do x8 serve para espelhar o
   // caractere 0.
   Lcd::send_string(String("01:17        10\x8"));
+
+  power_btn.setup();
+  configuration_btn.setup();
+  increment_btn.setup();
+  decrement_btn.setup();
+
+  set_bit(DDRD, PD2);
 }
 
-void loop() {}
+void loop()
+{
+  static const uint8_t buttons_rate_limit = 15;
+  auto now = millis();
+
+  auto toggle_led = false;
+
+  if (now - power_btn.time_state > buttons_rate_limit)
+  {
+    power_btn.check();
+    power_btn.time_state = now;
+    if (power_btn.has_changed() && power_btn.has_been_pressed())
+    {
+      toggle_led = true;
+    }
+  }
+
+  if (now - configuration_btn.time_state > buttons_rate_limit)
+  {
+    configuration_btn.check();
+    configuration_btn.time_state = now;
+    if (configuration_btn.has_changed() && configuration_btn.has_been_pressed())
+    {
+      toggle_led = true;
+    }
+  }
+
+  if (now - increment_btn.time_state > buttons_rate_limit)
+  {
+    increment_btn.check();
+    increment_btn.time_state = now;
+    if (increment_btn.has_changed() && increment_btn.has_been_pressed())
+    {
+      toggle_led = true;
+    }
+  }
+
+  if (now - decrement_btn.time_state > buttons_rate_limit)
+  {
+    decrement_btn.check();
+    decrement_btn.time_state = now;
+    if (decrement_btn.has_changed() && decrement_btn.has_been_pressed())
+    {
+      toggle_led = true;
+    }
+  }
+
+  if (toggle_led) toggle_bit(PORTD, PD2);
+}
 
 #pragma endregion
 #pragma region classes methods implementations
@@ -255,9 +404,6 @@ void Lcd::register_custom_characters()
 
 void Lcd::setup()
 {
-  // Torna os primeiros 7 pinos do registrador D saídas (são os segmentos do
-  // led).
-  DDRD |= 0b01111111;
   // Torna saídas todos os pinos das linhas do LCD
   set_bit(DATA_DIR_REG_LINHAS_LCD, LCD_DB7);
   set_bit(DATA_DIR_REG_LINHAS_LCD, LCD_DB6);
