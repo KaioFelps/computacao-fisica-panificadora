@@ -2,7 +2,10 @@
 
 #include <avr/io.h>       // definições do componente especificado
 #include <avr/pgmspace.h> // para o uso do PROGMEM, gravação de dados na memória flash
+#include <stdint.h>
 #include <util/delay.h> // biblioteca para o uso das rotinas de _delay_ms e _delay_us()
+
+#pragma region defs
 
 #define F_CPU 16000000UL // define a frequencia do microcontrolador - 16MHz
 /**
@@ -40,6 +43,7 @@
  */
 #define LCD_DATA_TYPE_PIN PB0
 
+#pragma endregion
 #pragma region macros
 
 /// Coloca em 1 o bit x da variável Y
@@ -52,17 +56,14 @@
 #define get_bit(y, bit) (y & (1 << bit))
 
 #if (LCD_DATA_NIBBLE == 1)
-#define set_most_significant_nibble(data)                                      \
-  DADOS_LCD = (DADOS_LCD & 0x0F) | (0xF0 & data);
+#define set_most_significant_nibble(data) DADOS_LCD = (DADOS_LCD & 0x0F) | (0xF0 & data);
 
-#define set_less_significant_nibble(data)                                      \
-  DADOS_LCD = (DADOS_LCD & 0x0F) | (0xF0 & (data << 4));
+#define set_less_significant_nibble(data) DADOS_LCD = (DADOS_LCD & 0x0F) | (0xF0 & (data << 4));
 #else
-#define set_most_significant_nibble(trimmed_data_nibble)                       \
+#define set_most_significant_nibble(trimmed_data_nibble)                                           \
   DADOS_LCD = (DADOS_LCD & 0xF0) | (data >> 4);
 
-#define set_less_significant_nibble(data)                                      \
-  DADOS_LCD = (DADOS_LCD & 0xF0) | (0x0F & data);
+#define set_less_significant_nibble(data) DADOS_LCD = (DADOS_LCD & 0xF0) | (0x0F & data);
 #endif
 
 #pragma endregion
@@ -105,10 +106,6 @@ private:
   static void register_custom_characters();
 };
 
-#pragma once
-
-#include <stdint.h>
-
 class PinManager
 {
 private:
@@ -124,17 +121,14 @@ public:
     Output = true,
   };
 
-  PinManager(uint8_t pin, volatile uint8_t *port_input_reg,
-             volatile uint8_t *port_data_reg, volatile uint8_t *data_dir_reg)
-      : pin_(pin), port_input_reg_(port_input_reg),
-        port_data_reg_(port_data_reg), data_dir_reg_(data_dir_reg)
+  PinManager(uint8_t pin, volatile uint8_t *port_input_reg, volatile uint8_t *port_data_reg,
+             volatile uint8_t *data_dir_reg)
+      : pin_(pin), port_input_reg_(port_input_reg), port_data_reg_(port_data_reg),
+        data_dir_reg_(data_dir_reg)
   {
   }
 
-  bool get_digital_level() const
-  {
-    return get_bit(*this->port_input_reg_, this->pin_) != 0;
-  }
+  bool get_digital_level() const { return get_bit(*this->port_input_reg_, this->pin_) != 0; }
 
   void set_digital_level(bool digital_level) const
   {
@@ -165,10 +159,7 @@ public:
    * Estado de tempo utilizando pra aplicar o debounce em cada botão
    */
   unsigned long time_state = 0;
-  bool has_changed() const
-  {
-    return this->current_state != this->previous_state;
-  }
+  bool has_changed() const { return this->current_state != this->previous_state; }
   /**
    * Se, e somente se, `has_changed() == true`, este método retorna:
    * - `true` se o botão foi pressionado;
@@ -194,16 +185,150 @@ public:
   }
 };
 
+class Motor
+{
+private:
+  PinManager pin_manager;
+
+public:
+  Motor(PinManager pin_manager) : pin_manager(pin_manager) {}
+
+  void setup() { this->pin_manager.set_data_direction(PinManager::Output); }
+  void turn_on() { this->pin_manager.set_digital_level(true); }
+  void turn_off() { this->pin_manager.set_digital_level(false); }
+};
+
+class TemperatureManager
+{
+private:
+  PinManager resistance_pin_manager;
+  /**
+   * É o pino de conversão analógico-digital que deve ser selecionado
+   * para a leitura da temperatura. Por exemplo: o pino A0.
+   */
+  uint8_t channel_pin;
+  volatile uint8_t *digital_input_disable_reg;
+  volatile uint8_t temperature = 0;
+
+  uint8_t estimate_temperature_from_tension(uint16_t tension) {}
+
+public:
+  TemperatureManager(PinManager resistance_pin_manager, uint8_t channel_pin,
+                     volatile uint8_t *digital_input_disable_reg)
+      : resistance_pin_manager(resistance_pin_manager),
+        digital_input_disable_reg(digital_input_disable_reg), channel_pin(channel_pin)
+  {
+  }
+
+  void setup()
+  {
+    this->resistance_pin_manager.set_data_direction(PinManager::Output);
+
+    // DIDRx: Digital Input Disable Register x
+    // Um único pino no ATmega328 pode ser uma saída ou uma entrada (digital ou
+    // analógica); ele é multifuncional.
+    //
+    // A funcionalidade de entrada digital (um amplificador conectado no pino
+    // pra realizar a leitura digital) pode criar um ruído que atrapalha a
+    // leitura da entrada analógica. Por isso, desligamos o circuito que faz a
+    // leitura digital no pino que será lido para evitar que ele gere ruído e
+    // atrapalhe a leitura analógica.
+    //
+    // Observe que:
+    // Quando um bit em DIDRx é:
+    // * 0, então o buffer digital está ligado
+    // * 1, então o buffer digital está desligado
+    set_bit(*this->digital_input_disable_reg, this->channel_pin);
+  }
+
+  void turn_on() { this->resistance_pin_manager.set_digital_level(true); }
+  void turn_off() { this->resistance_pin_manager.set_digital_level(false); }
+
+  void begin()
+  {
+    // Reseta a seleção do pino de leitura (os últimos 4 bits)
+    ADMUX &= 0b11110000;
+    // Seleciona o bit de entrada desta instância
+    ADMUX |= this->channel_pin;
+    // Inicia a conversão
+    ADCSRA |= (1 << ADSC);
+  }
+
+  void update_temperature(uint16_t tension)
+  {
+    this->temperature = this->estimate_temperature_from_tension(tension);
+  }
+
+  uint8_t get_temperature() { return this->temperature; }
+};
+
+class Stopwatch
+{
+private:
+public:
+};
+
+class ProgramContext
+{
+public:
+  enum Phase
+  {
+    Kneading = 0,
+    Baking = 1,
+    Raising = 2,
+  };
+
+  enum State
+  {
+    Idle,
+    Working,
+    Configurating,
+  };
+
+  bool is_working();
+  bool is_idle();
+  bool is_configurating();
+
+  void begin_working();
+
+  void begin_configuration();
+  void make_idle();
+
+  uint16_t get_phase_minutes(Phase phase);
+  void increment_phase_minutes(Phase phase, int16_t step);
+
+private:
+  Phase current_phase = Phase::Kneading;
+  State current_state = State::Idle;
+  /**
+   * Tempo de cada etapa do processo Normal *em minutos*:
+   * 0: sova;
+   * 1: assadura; e
+   * 2: crescimento.
+   */
+  uint16_t phases_times[3] = {25, 90, 40};
+};
+
 #pragma endregion
-#pragma region global vars & configs
+#pragma region functions definitions
+
+void move_to_next_phase_to_configure();
+void handle_configuration();
+void display_configuration_screen();
+String pretty_print_minutes(uint16_t minutes);
 
 #pragma endregion
 #pragma region main
 
+auto program = ProgramContext();
+
 auto power_btn = Button(PinManager(PC2, &PINC, &PORTC, &DDRC));
 auto configuration_btn = Button(PinManager(PC3, &PINC, &PORTC, &DDRC));
-auto increment_btn = Button(PinManager(PC4, &PINC, &PORTC, &DDRC));
-auto decrement_btn = Button(PinManager(PC5, &PINC, &PORTC, &DDRC));
+auto increment_btn = Button(PinManager(PC5, &PINC, &PORTC, &DDRC));
+auto decrement_btn = Button(PinManager(PC4, &PINC, &PORTC, &DDRC));
+
+auto motor = Motor(PinManager(PD2, &PIND, &PORTD, &DDRD));
+auto temp_manager = TemperatureManager(PinManager(PD3, &PIND, &PORTD, &DDRD), A0, &DIDR0);
 
 void setup()
 {
@@ -223,57 +348,125 @@ void setup()
   increment_btn.setup();
   decrement_btn.setup();
 
-  set_bit(DDRD, PD2);
+  motor.setup();
+
+  // Configuração do conversor analógico-digital do microcontrolador do
+  // Arduino (ATmega328).
+  //
+  // Esse trecho coloca o ADMUX num estado 01 (REF0:REF1) que diz que a tensão
+  // usada pela porta AVCC (que alimenta o circuito analógico do
+  // microcontrolador) será a mesma tensão usada como a tensão de referência
+  // (valor máximo que o ADC pode medir).
+  ADMUX &= ~((1 << REFS0) | (1 << REFS1));
+  ADMUX |= (1 << REFS0);
+  // * ADCSRx: ADC Control and Status Register x
+  // * ADPSx: ADC Prescaler Select Bit x (é o x-nésimo bit menos significativo
+  // do registrador ADCSRx)
+
+  // Zera os bits do controlador & status B.
+  // Esse registrador controla a fonte de gatilho, entrada e modo do ADC. Ao
+  // zerar, estamos:
+  // * desabilitando a inicialização automática do ADC
+  // * deixando o ADC funcionar no seu modo simples de medição
+  // * desligamos outras configurações avançadas do ADC
+  ADCSRB = 0;
+  // Configura individualmente os 3 primeiros bits do controlador & status A,
+  // que definem o clock do conversor ADC (e outras funcionalidades do ADC).
+  ADCSRA &= 0b11111000;
+  // Essa configuração (0b111 = 128) divide o clock principal do
+  // microcontrolador por 128 para formar o clock de trabalho do ADC, isso é,
+  // declara que ADDCLK = CLK / 128.
+  //
+  // Para obter a precisão máxima de um ADC de 10 bits, o clock de conversão
+  // deve estar entre 50kHz e 200kHz, e com esse cálculo, conseguimos chegar num
+  // valor próximo, pois o arduino uno tem um clock de 16MHz, e 16000 (16 mega
+  // hertz) / 128 = 125 (em kiloheartz).
+  ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+  // ADIE: ADC Interrupt Enable
+  // Permite que uma interrupção (`ADC_vect) seja acionada sempre que o ADC
+  // terminar de medir a tensão e tiver um valor pronto.
+  ADCSRA |= (1 << ADIE);
+  // ADEN: ADC Enable
+  // Liga o ADC manualmente (a nível de hardware, tirando essa parte do circuito
+  // do modo de baixo consumo de energia).
+  ADCSRA |= (1 << ADEN);
+
+  temp_manager.setup();
 }
+
+// rates in milliseconds
+const uint8_t buttons_rate = 15;
+const uint16_t press_time_for_long_press = 2000;
+const uint16_t fast_incrementation_rate = 200;
+const uint8_t display_refresh_rate = 50;
+
+auto configuration_phase = ProgramContext::Phase::Kneading;
 
 void loop()
 {
-  static const uint8_t buttons_rate_limit = 15;
   auto now = millis();
 
-  auto toggle_led = false;
+  ////////////////////////////////////////////////////////////////////////////////////
+  // Entrando no modo de configuração
+  //
+  // - 1 clique em repouso: entra no modo de configuração;
+  // - 1 clique curto no modo de configuração: altera a fase a ser configurada;
+  // - 1 clique longo no modo de configuração: sai do modo de configuração.
+  ////////////////////////////////////////////////////////////////////////////////////
+  if (now - configuration_btn.time_state > buttons_rate)
+  {
+    static unsigned long configuration_btn_pressed_at = 0;
+    configuration_btn.check();
+    configuration_btn.time_state = now;
 
-  if (now - power_btn.time_state > buttons_rate_limit)
+    if (configuration_btn.has_changed() && configuration_btn.has_been_pressed())
+    {
+      if (program.is_idle())
+      {
+        program.begin_configuration();
+        configuration_phase = ProgramContext::Kneading;
+      }
+      else
+      {
+        configuration_btn_pressed_at = now;
+      }
+    }
+    else if (configuration_btn.has_changed() && program.is_configurating())
+    {
+      const auto delta = now - configuration_btn_pressed_at;
+      const auto is_long_press = delta >= press_time_for_long_press;
+      is_long_press ? program.make_idle() : move_to_next_phase_to_configure();
+    }
+  }
+
+  ////////////////////////////////////////////////////////////////////////////////////
+  // Configuração do tempo de cada fase.
+  // Cliques longos aumentam/diminuem de 5 em 5 a cada meio segundo até serem soltos.
+  ////////////////////////////////////////////////////////////////////////////////////
+  if (program.is_configurating()) handle_configuration();
+
+  if (program.is_idle() && now - power_btn.time_state > buttons_rate)
   {
     power_btn.check();
     power_btn.time_state = now;
     if (power_btn.has_changed() && power_btn.has_been_pressed())
     {
-      toggle_led = true;
+      program.begin_working();
     }
   }
 
-  if (now - configuration_btn.time_state > buttons_rate_limit)
+  static unsigned long last_display_update = 0;
+  if (now - last_display_update > display_refresh_rate)
   {
-    configuration_btn.check();
-    configuration_btn.time_state = now;
-    if (configuration_btn.has_changed() && configuration_btn.has_been_pressed())
-    {
-      toggle_led = true;
-    }
+    last_display_update = now;
+    if (program.is_configurating()) display_configuration_screen();
   }
+}
 
-  if (now - increment_btn.time_state > buttons_rate_limit)
-  {
-    increment_btn.check();
-    increment_btn.time_state = now;
-    if (increment_btn.has_changed() && increment_btn.has_been_pressed())
-    {
-      toggle_led = true;
-    }
-  }
-
-  if (now - decrement_btn.time_state > buttons_rate_limit)
-  {
-    decrement_btn.check();
-    decrement_btn.time_state = now;
-    if (decrement_btn.has_changed() && decrement_btn.has_been_pressed())
-    {
-      toggle_led = true;
-    }
-  }
-
-  if (toggle_led) toggle_bit(PORTD, PD2);
+ISR(ADC_vect)
+{
+  auto stable_tension = ADC;
+  temp_manager.update_temperature(stable_tension);
 }
 
 #pragma endregion
@@ -314,9 +507,7 @@ void Lcd::send_message(const uint8_t data, const MessageType msg_type)
   set_message_data_type_to_pin(msg_type);
   set_data_to_lcd(data);
 
-  const auto is_return_or_clean_instruction =
-      msg_type == MessageType::Instruction && data < 4;
-
+  const auto is_return_or_clean_instruction = msg_type == MessageType::Instruction && data < 4;
   if (is_return_or_clean_instruction) _delay_ms(2);
 }
 
@@ -415,6 +606,144 @@ void Lcd::setup()
 
   initialize_lcd();
   register_custom_characters();
+}
+
+bool ProgramContext::is_working() { return this->current_state == State::Working; }
+bool ProgramContext::is_idle() { return this->current_state == State::Idle; }
+bool ProgramContext::is_configurating() { return this->current_state == State::Configurating; }
+
+void ProgramContext::begin_working()
+{
+  this->current_state = State::Working;
+  this->current_phase = Phase::Kneading;
+}
+
+void ProgramContext::begin_configuration() { this->current_state = State::Configurating; }
+void ProgramContext::make_idle() { this->current_state = State::Idle; }
+
+uint16_t ProgramContext::get_phase_minutes(Phase phase) { return this->phases_times[phase]; }
+void ProgramContext::increment_phase_minutes(Phase phase, int16_t step = 1)
+{
+  const auto new_value = this->phases_times[phase] + step;
+  this->phases_times[phase] = new_value;
+}
+
+#pragma endregion
+#pragma region functions implementations
+
+void move_to_next_phase_to_configure()
+{
+  if (!program.is_configurating()) return;
+
+  switch (configuration_phase)
+  {
+  case ProgramContext::Kneading:
+    configuration_phase = ProgramContext::Raising;
+    return;
+  case ProgramContext::Raising:
+    configuration_phase = ProgramContext::Baking;
+    return;
+  default:
+    configuration_phase = ProgramContext::Kneading;
+  }
+}
+
+void handle_configuration()
+{
+  const auto now = millis();
+
+  static auto is_pressing_incrementation_buttons = false;
+  static auto buttons_pressed_at = 0;
+  static auto buttons_actions_time_state = 0;
+  const auto current_phase_minutes = program.get_phase_minutes(configuration_phase);
+
+  auto some_button_has_changed = false;
+  auto some_button_has_been_pressed = false;
+  /**
+   * Se um dos botões foi pressionado, essa variável dita se foi um incremento ou decrement.
+   * Caso contrário, qualquer informação nesta contida deve ser ignorada.
+   */
+  static auto should_increment = false;
+
+  if (now - increment_btn.time_state > buttons_rate)
+  {
+    increment_btn.check();
+    increment_btn.time_state = now;
+    if (increment_btn.has_changed()) some_button_has_changed = true;
+    if (increment_btn.has_been_pressed())
+    {
+      some_button_has_been_pressed = true;
+      should_increment = true;
+    }
+  }
+  // somente um dos dois botões será lido por vez e, caso ambos sejam pressionados
+  // simultaneamente, o incremento tem preferência.
+  else if (now - decrement_btn.time_state > buttons_rate)
+  {
+    decrement_btn.check();
+    decrement_btn.time_state = now;
+    if (decrement_btn.has_changed()) some_button_has_changed = true;
+    if (decrement_btn.has_been_pressed())
+    {
+      some_button_has_been_pressed = true;
+      should_increment = false;
+    }
+  }
+
+  if (some_button_has_changed && some_button_has_been_pressed)
+  {
+    buttons_pressed_at = now;
+    is_pressing_incrementation_buttons = true;
+    buttons_actions_time_state = now;
+    // realiza a primeira incrementação/decrementação assim que pressionado
+    // as seguintes acontecerão a cada meio segundo
+    program.increment_phase_minutes(configuration_phase, should_increment ? 1 : -1);
+  }
+  else if (some_button_has_changed)
+  {
+    is_pressing_incrementation_buttons = false;
+  }
+  else if (is_pressing_incrementation_buttons &&
+           now - buttons_actions_time_state >= fast_incrementation_rate)
+  {
+    buttons_actions_time_state = now;
+    const auto is_long_press = now - buttons_pressed_at >= press_time_for_long_press;
+    auto incrementation = is_long_press ? 5 : 1;
+    if (!should_increment) should_increment *= -1;
+    program.increment_phase_minutes(configuration_phase, incrementation);
+  }
+}
+
+void display_configuration_screen()
+{
+  Lcd::move_cursor(Lcd::Line::Upper, 0);
+  Lcd::send_string(String("Config. "));
+
+  switch (configuration_phase)
+  {
+  case ProgramContext::Kneading:
+    Lcd::send_string("    sova");
+    break;
+  case ProgramContext::Raising:
+    Lcd::send_string("  cresc.");
+    break;
+  case ProgramContext::Baking:
+    Lcd::send_string("assadura");
+    break;
+  }
+
+  Lcd::move_cursor(Lcd::Line::Lower, 0);
+  Lcd::send_string(pretty_print_minutes(program.get_phase_minutes(configuration_phase)));
+}
+
+String pretty_print_minutes(uint16_t minutes)
+{
+  const uint8_t hours = minutes / 60;
+  const uint8_t left_minutes = minutes % 60;
+
+  char buffer[6];
+  snprintf(buffer, sizeof(buffer), "%02d:%02d", hours, left_minutes);
+  return String(buffer);
 }
 
 #pragma endregion
