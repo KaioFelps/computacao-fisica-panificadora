@@ -271,6 +271,8 @@ public:
 class ProgramContext
 {
 public:
+  static const uint16_t MAX_TIME = 99 * 60 + 59;
+
   enum Phase
   {
     Kneading = 0,
@@ -334,14 +336,6 @@ void setup()
 {
   Lcd::setup();
   Lcd::turn_cursor_off();
-  Lcd::send_string(String("Time        Temp"));
-  Lcd::move_cursor(Lcd::Line::Lower, 0);
-  // A oitava posição de caracteres customizados na verdade espelha o caractere
-  // 0. Isso permite que imprimamos o símbolo de grau Celsius diretamente na
-  // string. Observe que colocar \0 não funciona devido a esse ser o caractere
-  // nulo das strings em C, então o truque do x8 serve para espelhar o
-  // caractere 0.
-  Lcd::send_string(String("01:17        10\x8"));
 
   power_btn.setup();
   configuration_btn.setup();
@@ -396,7 +390,8 @@ void setup()
 
 // rates in milliseconds
 const uint8_t buttons_rate = 15;
-const uint16_t press_time_for_long_press = 2000;
+const uint16_t press_time_for_long_press = 1000;
+const uint16_t press_time_for_incrementation_long_press = 3000;
 const uint16_t fast_incrementation_rate = 200;
 const uint8_t display_refresh_rate = 50;
 
@@ -416,6 +411,7 @@ void loop()
   if (now - configuration_btn.time_state > buttons_rate)
   {
     static unsigned long configuration_btn_pressed_at = 0;
+    static bool has_just_entered_configuration_mode = false;
     configuration_btn.check();
     configuration_btn.time_state = now;
 
@@ -425,17 +421,23 @@ void loop()
       {
         program.begin_configuration();
         configuration_phase = ProgramContext::Kneading;
+        has_just_entered_configuration_mode = true;
       }
-      else
+      else if (program.is_configurating())
       {
         configuration_btn_pressed_at = now;
       }
     }
-    else if (configuration_btn.has_changed() && program.is_configurating())
+    else if (configuration_btn.has_changed())
     {
-      const auto delta = now - configuration_btn_pressed_at;
-      const auto is_long_press = delta >= press_time_for_long_press;
-      is_long_press ? program.make_idle() : move_to_next_phase_to_configure();
+      if (program.is_configurating() && !has_just_entered_configuration_mode)
+      {
+        const auto delta = now - configuration_btn_pressed_at;
+        const auto is_long_press = delta >= press_time_for_long_press;
+        is_long_press ? program.make_idle() : move_to_next_phase_to_configure();
+      }
+
+      has_just_entered_configuration_mode = false;
     }
   }
 
@@ -459,7 +461,20 @@ void loop()
   if (now - last_display_update > display_refresh_rate)
   {
     last_display_update = now;
-    if (program.is_configurating()) display_configuration_screen();
+    if (program.is_configurating())
+      display_configuration_screen();
+    else if (program.is_idle())
+    {
+      Lcd::move_cursor(Lcd::Line::Upper, 0);
+      Lcd::send_string(String("Time        Temp"));
+      Lcd::move_cursor(Lcd::Line::Lower, 0);
+      // A oitava posição de caracteres customizados na verdade espelha o caractere
+      // 0. Isso permite que imprimamos o símbolo de grau Celsius diretamente na
+      // string. Observe que colocar \0 não funciona devido a esse ser o caractere
+      // nulo das strings em C, então o truque do x8 serve para espelhar o
+      // caractere 0.
+      Lcd::send_string(String("01:17        10\x8"));
+    }
   }
 }
 
@@ -624,7 +639,9 @@ void ProgramContext::make_idle() { this->current_state = State::Idle; }
 uint16_t ProgramContext::get_phase_minutes(Phase phase) { return this->phases_times[phase]; }
 void ProgramContext::increment_phase_minutes(Phase phase, int16_t step = 1)
 {
-  const auto new_value = this->phases_times[phase] + step;
+  int16_t new_value = this->phases_times[static_cast<uint8_t>(phase)] + step;
+  if (new_value < 0) new_value = 0;
+  if (new_value > MAX_TIME) new_value = MAX_TIME;
   this->phases_times[phase] = new_value;
 }
 
@@ -651,12 +668,13 @@ void move_to_next_phase_to_configure()
 void handle_configuration()
 {
   const auto now = millis();
+  if (now - increment_btn.time_state <= buttons_rate) return;
 
   static auto is_pressing_incrementation_buttons = false;
-  static auto buttons_pressed_at = 0;
-  static auto buttons_actions_time_state = 0;
-  const auto current_phase_minutes = program.get_phase_minutes(configuration_phase);
+  static unsigned long buttons_pressed_at = 0;
+  static unsigned long buttons_actions_time_state = 0;
 
+  const auto current_phase_minutes = program.get_phase_minutes(configuration_phase);
   auto some_button_has_changed = false;
   auto some_button_has_been_pressed = false;
   /**
@@ -665,53 +683,55 @@ void handle_configuration()
    */
   static auto should_increment = false;
 
-  if (now - increment_btn.time_state > buttons_rate)
+  decrement_btn.check();
+  decrement_btn.time_state = now;
+  increment_btn.check();
+  increment_btn.time_state = now;
+
+  // caso ambos sejam pressionados simultaneamente, o incremento tem preferência.
+  if (decrement_btn.has_changed() || increment_btn.has_changed()) some_button_has_changed = true;
+  if (decrement_btn.has_been_pressed())
   {
-    increment_btn.check();
-    increment_btn.time_state = now;
-    if (increment_btn.has_changed()) some_button_has_changed = true;
-    if (increment_btn.has_been_pressed())
-    {
-      some_button_has_been_pressed = true;
-      should_increment = true;
-    }
+    some_button_has_been_pressed = true;
+    should_increment = false;
   }
-  // somente um dos dois botões será lido por vez e, caso ambos sejam pressionados
-  // simultaneamente, o incremento tem preferência.
-  else if (now - decrement_btn.time_state > buttons_rate)
+  else if (increment_btn.has_been_pressed())
   {
-    decrement_btn.check();
-    decrement_btn.time_state = now;
-    if (decrement_btn.has_changed()) some_button_has_changed = true;
-    if (decrement_btn.has_been_pressed())
-    {
-      some_button_has_been_pressed = true;
-      should_increment = false;
-    }
+    some_button_has_been_pressed = true;
+    should_increment = true;
   }
 
   if (some_button_has_changed && some_button_has_been_pressed)
   {
     buttons_pressed_at = now;
     is_pressing_incrementation_buttons = true;
-    buttons_actions_time_state = now;
+    // garante que haverá uma pausa até que comece a incrementar continuamente,
+    // evitando incrementos acidentais
+    buttons_actions_time_state = now + fast_incrementation_rate * 2;
     // realiza a primeira incrementação/decrementação assim que pressionado
     // as seguintes acontecerão a cada meio segundo
     program.increment_phase_minutes(configuration_phase, should_increment ? 1 : -1);
+    return;
   }
-  else if (some_button_has_changed)
+
+  if (some_button_has_changed)
   {
     is_pressing_incrementation_buttons = false;
+    return;
   }
-  else if (is_pressing_incrementation_buttons &&
-           now - buttons_actions_time_state >= fast_incrementation_rate)
+
+  auto delta = (long long)now - (long long)buttons_actions_time_state;
+  if (!is_pressing_incrementation_buttons || delta < fast_incrementation_rate)
   {
-    buttons_actions_time_state = now;
-    const auto is_long_press = now - buttons_pressed_at >= press_time_for_long_press;
-    auto incrementation = is_long_press ? 5 : 1;
-    if (!should_increment) should_increment *= -1;
-    program.increment_phase_minutes(configuration_phase, incrementation);
+    return;
   }
+
+  buttons_actions_time_state = now;
+  const auto is_long_press = now - buttons_pressed_at >= press_time_for_incrementation_long_press;
+
+  auto incrementation = is_long_press ? 5 : 1;
+  if (!should_increment) incrementation *= -1;
+  program.increment_phase_minutes(configuration_phase, incrementation);
 }
 
 void display_configuration_screen()
