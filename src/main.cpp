@@ -348,7 +348,7 @@ void move_to_next_phase_to_configure();
 void handle_configuration();
 void display_configuration_screen();
 void append_temperature_to_lcd_string(char lcd_string[16]);
-String pretty_stringify_minutes(uint16_t minutes);
+void prepend_formatted_minutes_to_lcd_string(char lcd_string[16], uint16_t minutes);
 
 #pragma endregion
 #pragma region main
@@ -778,28 +778,37 @@ void display_configuration_screen()
   switch (configuration_phase)
   {
   case ProgramContext::Kneading:
-    Lcd::send_string("    sova");
+    Lcd::send_string("sova    ");
     break;
   case ProgramContext::Raising:
-    Lcd::send_string("  cresc.");
+    Lcd::send_string("cresc.  ");
     break;
   case ProgramContext::Baking:
     Lcd::send_string("assadura");
     break;
   }
 
+  auto buffer = String("                ");
+  const auto minutes = program.get_phase_minutes(configuration_phase);
+  prepend_formatted_minutes_to_lcd_string(buffer.begin(), minutes);
+
   Lcd::move_cursor(Lcd::Line::Lower, 0);
-  Lcd::send_string(pretty_stringify_minutes(program.get_phase_minutes(configuration_phase)));
+  Lcd::send_string(buffer);
 }
 
-String pretty_stringify_minutes(uint16_t minutes)
+void prepend_formatted_minutes_to_lcd_string(char lcd_string[16], uint16_t minutes)
 {
   const uint8_t hours = minutes / 60;
   const uint8_t left_minutes = minutes % 60;
 
   char buffer[6];
   snprintf(buffer, sizeof(buffer), "%02d:%02d", hours, left_minutes);
-  return String(buffer);
+
+  const auto buffer_copy_limit = sizeof(buffer) - 1; // ignora o caractere nulo
+  for (size_t i = 0; i < buffer_copy_limit; i++)
+  {
+    lcd_string[i] = buffer[i];
+  }
 }
 
 void append_temperature_to_lcd_string(char lcd_string[16])
