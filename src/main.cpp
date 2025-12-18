@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #include <avr/io.h>       // definições do componente especificado
 #include <avr/pgmspace.h> // para o uso do PROGMEM, gravação de dados na memória flash
 #include <stdint.h>
@@ -206,17 +205,45 @@ private:
    * É o pino de conversão analógico-digital que deve ser selecionado
    * para a leitura da temperatura. Por exemplo: o pino A0.
    */
-  uint8_t channel_pin;
+  const uint8_t analogic_pin;
+  const uint8_t analogic_channel;
   volatile uint8_t *digital_input_disable_reg;
   volatile uint8_t temperature = 0;
 
-  uint8_t estimate_temperature_from_tension(uint16_t tension) {}
+  uint16_t estimate_temperature_from_tension(uint16_t tension_mv)
+  {
+    const uint8_t curvature = 24;
+    const uint16_t slope = 540;
+    const uint8_t offset = 95;
+    /**
+     * Temp : Volts -> C°
+     * Temp(tensao) = 2,4 * tensao^(2) + 54 * tensao + 9,5
+     *
+     * Como vamos receber milivolts (1V = 1000mV), o cálculo muda.
+     * Para isso, dividimos todos os termos que utilizam a tensão por 1000^(k) onde
+     * k é o expoente da tensão.
+     *
+     * Por exemplo, para o termo quadrático: 2,4 * tensao^(2), convertendo para milivolts
+     * obtemos (2,4 * tensao^(2)) / 1000^(2).
+     *
+     * Para evitar cálculo com floats, todos os coeficientes são multiplicados por 10
+     * e precisam ser divididos por 10 ao final do cálculo. Portanto,
+     * (24 * tensao^(2)) / 1000^(2) ou (24 * tensao^(2)) / 1.000.000, e
+     * temperatura = (termo quadrático + termo linear + constante) / 10.
+     */
+    const uint32_t quadratic_term =
+        ((uint32_t)curvature * tension_mv * tension_mv) / (uint32_t)1000000;
+    const uint16_t linear_term = (slope * (uint32_t)tension_mv) / 1000;
+    // Somamos `5` pra simular um arredondamento de teto.
+    const auto temperature = (quadratic_term + linear_term + offset + 5) / 10;
+    return (uint16_t)temperature;
+  }
 
 public:
-  TemperatureManager(PinManager resistance_pin_manager, uint8_t channel_pin,
+  TemperatureManager(PinManager resistance_pin_manager, uint8_t analogic_pin,
                      volatile uint8_t *digital_input_disable_reg)
-      : resistance_pin_manager(resistance_pin_manager),
-        digital_input_disable_reg(digital_input_disable_reg), channel_pin(channel_pin)
+      : resistance_pin_manager(resistance_pin_manager), analogic_pin(analogic_pin),
+        analogic_channel(analogic_pin - 14), digital_input_disable_reg(digital_input_disable_reg)
   {
   }
 
@@ -238,7 +265,7 @@ public:
     // Quando um bit em DIDRx é:
     // * 0, então o buffer digital está ligado
     // * 1, então o buffer digital está desligado
-    set_bit(*this->digital_input_disable_reg, this->channel_pin);
+    set_bit(*this->digital_input_disable_reg, this->analogic_channel);
   }
 
   void turn_on() { this->resistance_pin_manager.set_digital_level(true); }
@@ -249,13 +276,16 @@ public:
     // Reseta a seleção do pino de leitura (os últimos 4 bits)
     ADMUX &= 0b11110000;
     // Seleciona o bit de entrada desta instância
-    ADMUX |= this->channel_pin;
+    ADMUX |= this->analogic_channel;
     // Inicia a conversão
     ADCSRA |= (1 << ADSC);
   }
 
-  void update_temperature(uint16_t tension)
+  void update_temperature(uint16_t adc_entry)
   {
+    const auto adc_max_value = 1023;
+    const auto max_milivoltage = 5000;
+    const uint16_t tension = ((uint32_t)adc_entry * max_milivoltage) / adc_max_value;
     this->temperature = this->estimate_temperature_from_tension(tension);
   }
 
@@ -317,7 +347,8 @@ private:
 void move_to_next_phase_to_configure();
 void handle_configuration();
 void display_configuration_screen();
-String pretty_print_minutes(uint16_t minutes);
+void append_temperature_to_lcd_string(char lcd_string[16]);
+String pretty_stringify_minutes(uint16_t minutes);
 
 #pragma endregion
 #pragma region main
@@ -388,18 +419,26 @@ void setup()
   temp_manager.setup();
 }
 
-// rates in milliseconds
+// taxas em milisegundos
 const uint8_t buttons_rate = 15;
-const uint16_t press_time_for_long_press = 1000;
+const uint16_t press_time_for_long_press = 500;
 const uint16_t press_time_for_incrementation_long_press = 3000;
 const uint16_t fast_incrementation_rate = 200;
 const uint8_t display_refresh_rate = 50;
+const uint8_t temperature_read_refresh_rate = 100;
 
 auto configuration_phase = ProgramContext::Phase::Kneading;
 
 void loop()
 {
   auto now = millis();
+
+  static unsigned long update_temperature_time_state = 0;
+  if (now - update_temperature_time_state > temperature_read_refresh_rate)
+  {
+    update_temperature_time_state = now;
+    temp_manager.begin();
+  }
 
   ////////////////////////////////////////////////////////////////////////////////////
   // Entrando no modo de configuração
@@ -467,13 +506,11 @@ void loop()
     {
       Lcd::move_cursor(Lcd::Line::Upper, 0);
       Lcd::send_string(String("Time        Temp"));
+
       Lcd::move_cursor(Lcd::Line::Lower, 0);
-      // A oitava posição de caracteres customizados na verdade espelha o caractere
-      // 0. Isso permite que imprimamos o símbolo de grau Celsius diretamente na
-      // string. Observe que colocar \0 não funciona devido a esse ser o caractere
-      // nulo das strings em C, então o truque do x8 serve para espelhar o
-      // caractere 0.
-      Lcd::send_string(String("01:17        10\x8"));
+      auto buffer = String("01:17             ");
+      append_temperature_to_lcd_string(buffer.begin());
+      Lcd::send_string(buffer);
     }
   }
 }
@@ -641,7 +678,7 @@ void ProgramContext::increment_phase_minutes(Phase phase, int16_t step = 1)
 {
   int16_t new_value = this->phases_times[static_cast<uint8_t>(phase)] + step;
   if (new_value < 0) new_value = 0;
-  if (new_value > MAX_TIME) new_value = MAX_TIME;
+  if ((uint16_t)new_value > MAX_TIME) new_value = MAX_TIME;
   this->phases_times[phase] = new_value;
 }
 
@@ -674,7 +711,6 @@ void handle_configuration()
   static unsigned long buttons_pressed_at = 0;
   static unsigned long buttons_actions_time_state = 0;
 
-  const auto current_phase_minutes = program.get_phase_minutes(configuration_phase);
   auto some_button_has_changed = false;
   auto some_button_has_been_pressed = false;
   /**
@@ -753,10 +789,10 @@ void display_configuration_screen()
   }
 
   Lcd::move_cursor(Lcd::Line::Lower, 0);
-  Lcd::send_string(pretty_print_minutes(program.get_phase_minutes(configuration_phase)));
+  Lcd::send_string(pretty_stringify_minutes(program.get_phase_minutes(configuration_phase)));
 }
 
-String pretty_print_minutes(uint16_t minutes)
+String pretty_stringify_minutes(uint16_t minutes)
 {
   const uint8_t hours = minutes / 60;
   const uint8_t left_minutes = minutes % 60;
@@ -764,6 +800,21 @@ String pretty_print_minutes(uint16_t minutes)
   char buffer[6];
   snprintf(buffer, sizeof(buffer), "%02d:%02d", hours, left_minutes);
   return String(buffer);
+}
+
+void append_temperature_to_lcd_string(char lcd_string[16])
+{
+  auto offset = 15;
+  auto temperature = temp_manager.get_temperature();
+  const auto degree_mark_character = 0;
+
+  lcd_string[offset--] = degree_mark_character;
+
+  while (temperature != 0)
+  {
+    lcd_string[offset--] = temperature % 10 + '0';
+    temperature /= 10;
+  }
 }
 
 #pragma endregion
