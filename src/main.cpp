@@ -83,7 +83,7 @@ public:
     Lower
   };
 
-  static void setup();
+  static void begin();
   static void send_command(const uint8_t command_byte);
   static void send_character(const uint8_t character_byte);
   static void send_string(const String string);
@@ -142,6 +142,43 @@ public:
   }
 };
 
+class Buzzer
+{
+private:
+  const uint8_t pin;
+  const uint16_t frequency;
+
+  bool is_playing_ = false;
+  unsigned long time_state = 0;
+  uint16_t duration_ms = 0;
+
+public:
+  Buzzer(uint8_t pin, uint16_t frequency) : pin(pin), frequency(frequency) {}
+
+  bool is_playing() const { return this->is_playing_; }
+
+  void start(unsigned long now, uint16_t duration_ms)
+  {
+    tone(this->pin, this->frequency);
+    this->is_playing_ = true;
+    this->time_state = now;
+    this->duration_ms = duration_ms;
+  }
+
+  void update(unsigned long now)
+  {
+    if (this->is_playing_ && now - this->time_state > this->duration_ms) this->stop();
+  }
+
+  void stop()
+  {
+    noTone(this->pin);
+    this->is_playing_ = false;
+  }
+
+  void begin(PinManager pin_manager) const { pin_manager.set_data_direction(PinManager::Output); }
+};
+
 class Button
 {
 private:
@@ -176,7 +213,7 @@ public:
     this->current_state = this->pin_manager.get_digital_level();
   }
 
-  void setup()
+  void begin()
   {
     this->pin_manager.set_data_direction(PinManager::Input);
     // ativa o registor pull-up
@@ -192,7 +229,7 @@ private:
 public:
   Motor(PinManager pin_manager) : pin_manager(pin_manager) {}
 
-  void setup() { this->pin_manager.set_data_direction(PinManager::Output); }
+  void begin() { this->pin_manager.set_data_direction(PinManager::Output); }
   void turn_on() { this->pin_manager.set_digital_level(true); }
   void turn_off() { this->pin_manager.set_digital_level(false); }
 };
@@ -247,7 +284,7 @@ public:
   {
   }
 
-  void setup()
+  void begin()
   {
     this->resistance_pin_manager.set_data_direction(PinManager::Output);
 
@@ -271,7 +308,7 @@ public:
   void turn_on() { this->resistance_pin_manager.set_digital_level(true); }
   void turn_off() { this->resistance_pin_manager.set_digital_level(false); }
 
-  void begin()
+  void start_reading()
   {
     // Reseta a seleção do pino de leitura (os últimos 4 bits)
     ADMUX &= 0b11110000;
@@ -292,13 +329,7 @@ public:
   uint8_t get_temperature() { return this->temperature; }
 };
 
-class Stopwatch
-{
-private:
-public:
-};
-
-class ProgramContext
+class Program
 {
 public:
   static const uint16_t MAX_TIME = 99 * 60 + 59;
@@ -313,21 +344,30 @@ public:
   enum State
   {
     Idle,
-    Working,
+    Running,
     Configurating,
   };
 
-  bool is_working();
+  bool is_running();
   bool is_idle();
   bool is_configurating();
 
-  void begin_working();
+  void start();
+  void stop();
 
   void begin_configuration();
   void make_idle();
 
-  uint16_t get_phase_minutes(Phase phase);
+  uint16_t get_phase_minutes(Phase phase) const;
   void increment_phase_minutes(Phase phase, int16_t step);
+
+  Phase get_active_phase() const;
+  void start_next_phase();
+
+  /**
+   * Checa se um ciclo foi completado e imediatamente reseta a flag.
+   */
+  bool check_cycle_has_finished();
 
 private:
   Phase current_phase = Phase::Kneading;
@@ -339,13 +379,95 @@ private:
    * 2: crescimento.
    */
   uint16_t phases_times[3] = {25, 90, 40};
+  /**
+   * Uma flag que indica se um ciclo terminou. Deve ser efêmera.
+   */
+  bool has_finished_a_cycle = false;
+};
+
+class Stopwatch
+{
+private:
+  enum State
+  {
+    Running,
+    Idle,
+    Finished,
+  };
+
+  /**
+   * O millis exato em que o cronômetro começou a contar (por ser iniciado ou
+   * despausado).
+   */
+  unsigned long timer_begin_millis_print = 0;
+  /**
+   * A quantidade de tempo que o cronômetro deve marcar.
+   */
+  unsigned long goal = 0;
+  uint16_t remaining_minutes = 0;
+  State state = State::Idle;
+
+  void clean()
+  {
+    this->timer_begin_millis_print = 0;
+    this->goal = 0;
+  }
+
+  void finish()
+  {
+    this->clean();
+    this->state = State::Finished;
+  }
+
+public:
+  bool is_finished() const { return this->state == State::Finished; }
+
+  bool is_running() const { return this->state == State::Running; }
+
+  bool is_idle() const { return this->state == State::Idle; }
+
+  uint16_t get_remaining_minutes() const { return this->remaining_minutes; }
+
+  State get_state() const { return this->state; }
+
+  void set_timer(uint16_t minutes) { this->goal = (unsigned long)minutes * 60 * 1000; }
+
+  void start(unsigned long begin_millis_print)
+  {
+    this->state = State::Running;
+    this->timer_begin_millis_print = begin_millis_print;
+    this->remaining_minutes = 0;
+  }
+
+  void stop()
+  {
+    this->state = State::Idle;
+    this->clean();
+  }
+
+  void calculate_current_time(unsigned long now)
+  {
+    if (this->state != State::Running) return;
+
+    const auto run_millis = now - this->timer_begin_millis_print;
+    const auto remaining_millis = run_millis > this->goal ? 0 : this->goal - run_millis;
+
+    if (remaining_millis == 0) this->finish();
+
+    const auto remaining_seconds = remaining_millis / 1000;
+    // Arredondamento de teto para inteiros
+    const auto remaining_minutes = (remaining_seconds + 59) / 60;
+    this->remaining_minutes = ceil(remaining_minutes);
+  }
 };
 
 #pragma endregion
 #pragma region functions definitions
 
+void update_lcd_display();
 void move_to_next_phase_to_configure();
 void handle_configuration();
+void handle_configuration_mode_management();
 void display_configuration_screen();
 void append_temperature_to_lcd_string(char lcd_string[16]);
 void prepend_formatted_minutes_to_lcd_string(char lcd_string[16], uint16_t minutes);
@@ -353,27 +475,32 @@ void prepend_formatted_minutes_to_lcd_string(char lcd_string[16], uint16_t minut
 #pragma endregion
 #pragma region main
 
-auto program = ProgramContext();
+auto program = Program();
 
 auto power_btn = Button(PinManager(PC2, &PINC, &PORTC, &DDRC));
 auto configuration_btn = Button(PinManager(PC3, &PINC, &PORTC, &DDRC));
 auto increment_btn = Button(PinManager(PC5, &PINC, &PORTC, &DDRC));
 auto decrement_btn = Button(PinManager(PC4, &PINC, &PORTC, &DDRC));
 
+auto buzzer = Buzzer(A1, 300);
 auto motor = Motor(PinManager(PD2, &PIND, &PORTD, &DDRD));
 auto temp_manager = TemperatureManager(PinManager(PD3, &PIND, &PORTD, &DDRD), A0, &DIDR0);
+auto stopwatch = Stopwatch();
 
 void setup()
 {
-  Lcd::setup();
+  Serial.begin(9600);
+  Lcd::begin();
   Lcd::turn_cursor_off();
 
-  power_btn.setup();
-  configuration_btn.setup();
-  increment_btn.setup();
-  decrement_btn.setup();
+  buzzer.begin(PinManager(PC1, &PINC, &PORTC, &DDRC));
 
-  motor.setup();
+  power_btn.begin();
+  configuration_btn.begin();
+  increment_btn.begin();
+  decrement_btn.begin();
+
+  motor.begin();
 
   // Configuração do conversor analógico-digital do microcontrolador do
   // Arduino (ATmega328).
@@ -416,29 +543,24 @@ void setup()
   // do modo de baixo consumo de energia).
   ADCSRA |= (1 << ADEN);
 
-  temp_manager.setup();
+  temp_manager.begin();
 }
 
 // taxas em milisegundos
 const uint8_t buttons_rate = 15;
 const uint16_t press_time_for_long_press = 500;
-const uint16_t press_time_for_incrementation_long_press = 3000;
+const uint16_t press_time_for_incrementation_long_press = 2000;
 const uint16_t fast_incrementation_rate = 200;
 const uint8_t display_refresh_rate = 50;
 const uint8_t temperature_read_refresh_rate = 100;
+const uint8_t stopwatch_check_refresh_rate = 250;
+const uint16_t buzzer_duration = 500;
 
-auto configuration_phase = ProgramContext::Phase::Kneading;
+auto configuration_phase = Program::Phase::Kneading;
 
 void loop()
 {
   auto now = millis();
-
-  static unsigned long update_temperature_time_state = 0;
-  if (now - update_temperature_time_state > temperature_read_refresh_rate)
-  {
-    update_temperature_time_state = now;
-    temp_manager.begin();
-  }
 
   ////////////////////////////////////////////////////////////////////////////////////
   // Entrando no modo de configuração
@@ -447,38 +569,7 @@ void loop()
   // - 1 clique curto no modo de configuração: altera a fase a ser configurada;
   // - 1 clique longo no modo de configuração: sai do modo de configuração.
   ////////////////////////////////////////////////////////////////////////////////////
-  if (now - configuration_btn.time_state > buttons_rate)
-  {
-    static unsigned long configuration_btn_pressed_at = 0;
-    static bool has_just_entered_configuration_mode = false;
-    configuration_btn.check();
-    configuration_btn.time_state = now;
-
-    if (configuration_btn.has_changed() && configuration_btn.has_been_pressed())
-    {
-      if (program.is_idle())
-      {
-        program.begin_configuration();
-        configuration_phase = ProgramContext::Kneading;
-        has_just_entered_configuration_mode = true;
-      }
-      else if (program.is_configurating())
-      {
-        configuration_btn_pressed_at = now;
-      }
-    }
-    else if (configuration_btn.has_changed())
-    {
-      if (program.is_configurating() && !has_just_entered_configuration_mode)
-      {
-        const auto delta = now - configuration_btn_pressed_at;
-        const auto is_long_press = delta >= press_time_for_long_press;
-        is_long_press ? program.make_idle() : move_to_next_phase_to_configure();
-      }
-
-      has_just_entered_configuration_mode = false;
-    }
-  }
+  if (now - configuration_btn.time_state > buttons_rate) handle_configuration_mode_management();
 
   ////////////////////////////////////////////////////////////////////////////////////
   // Configuração do tempo de cada fase.
@@ -492,27 +583,53 @@ void loop()
     power_btn.time_state = now;
     if (power_btn.has_changed() && power_btn.has_been_pressed())
     {
-      program.begin_working();
+      program.start();
     }
   }
 
-  static unsigned long last_display_update = 0;
-  if (now - last_display_update > display_refresh_rate)
+  if (program.is_running())
   {
-    last_display_update = now;
-    if (program.is_configurating())
-      display_configuration_screen();
-    else if (program.is_idle())
+    static unsigned long update_temperature_time_state = 0;
+    if (now - update_temperature_time_state > temperature_read_refresh_rate)
     {
-      Lcd::move_cursor(Lcd::Line::Upper, 0);
-      Lcd::send_string(String("Time        Temp"));
+      update_temperature_time_state = now;
+      temp_manager.start_reading();
+    }
 
-      Lcd::move_cursor(Lcd::Line::Lower, 0);
-      auto buffer = String("01:17             ");
-      append_temperature_to_lcd_string(buffer.begin());
-      Lcd::send_string(buffer);
+    if (stopwatch.is_idle())
+    {
+      const auto phase_minutes = program.get_phase_minutes(program.get_active_phase());
+      Serial.print("Começando a contar minutos ");
+      Serial.println(phase_minutes);
+      stopwatch.set_timer(phase_minutes);
+      stopwatch.start(now);
+    }
+
+    if (stopwatch.is_finished())
+    {
+      stopwatch.stop();
+      program.start_next_phase();
+      // TODO
+      // handle_program_phase_begin();
+    }
+
+    static unsigned long stopwatch_check_time_state = 0;
+    if (stopwatch.is_running() && now - stopwatch_check_time_state > stopwatch_check_refresh_rate)
+    {
+      stopwatch_check_time_state = now;
+      stopwatch.calculate_current_time(now);
+      Serial.println(stopwatch.get_remaining_minutes());
+    }
+
+    if (program.check_cycle_has_finished())
+    {
+      buzzer.start(now, buzzer_duration);
+      Serial.println("tocar buzzer");
     }
   }
+
+  buzzer.update(now);
+  update_lcd_display();
 }
 
 ISR(ADC_vect)
@@ -645,7 +762,7 @@ void Lcd::register_custom_characters()
   move_cursor(Line::Upper, 0);
 }
 
-void Lcd::setup()
+void Lcd::begin()
 {
   // Torna saídas todos os pinos das linhas do LCD
   set_bit(DATA_DIR_REG_LINHAS_LCD, LCD_DB7);
@@ -660,21 +777,23 @@ void Lcd::setup()
   register_custom_characters();
 }
 
-bool ProgramContext::is_working() { return this->current_state == State::Working; }
-bool ProgramContext::is_idle() { return this->current_state == State::Idle; }
-bool ProgramContext::is_configurating() { return this->current_state == State::Configurating; }
+bool Program::is_running() { return this->current_state == State::Running; }
+bool Program::is_idle() { return this->current_state == State::Idle; }
+bool Program::is_configurating() { return this->current_state == State::Configurating; }
 
-void ProgramContext::begin_working()
+void Program::start()
 {
-  this->current_state = State::Working;
+  this->current_state = State::Running;
   this->current_phase = Phase::Kneading;
 }
 
-void ProgramContext::begin_configuration() { this->current_state = State::Configurating; }
-void ProgramContext::make_idle() { this->current_state = State::Idle; }
+Program::Phase Program::get_active_phase() const { return this->current_phase; }
 
-uint16_t ProgramContext::get_phase_minutes(Phase phase) { return this->phases_times[phase]; }
-void ProgramContext::increment_phase_minutes(Phase phase, int16_t step = 1)
+void Program::begin_configuration() { this->current_state = State::Configurating; }
+void Program::make_idle() { this->current_state = State::Idle; }
+
+uint16_t Program::get_phase_minutes(Phase phase) const { return this->phases_times[phase]; }
+void Program::increment_phase_minutes(Phase phase, int16_t step = 1)
 {
   int16_t new_value = this->phases_times[static_cast<uint8_t>(phase)] + step;
   if (new_value < 0) new_value = 0;
@@ -682,8 +801,82 @@ void ProgramContext::increment_phase_minutes(Phase phase, int16_t step = 1)
   this->phases_times[phase] = new_value;
 }
 
+void Program::start_next_phase()
+{
+  if (!this->is_running()) return;
+  switch (this->current_phase)
+  {
+  case Phase::Kneading:
+    this->current_phase = Phase::Raising;
+    return;
+  case Phase::Raising:
+    this->current_phase = Phase::Baking;
+    return;
+  case Phase::Baking:
+    this->stop();
+    this->has_finished_a_cycle = true;
+    return;
+  }
+}
+
+bool Program::check_cycle_has_finished()
+{
+  const auto has_finished = this->has_finished_a_cycle;
+  this->has_finished_a_cycle = false;
+  return has_finished;
+}
+
+void Program::stop() { this->current_state = State::Idle; }
+
 #pragma endregion
 #pragma region functions implementations
+
+void update_lcd_display()
+{
+  static unsigned long last_display_update = 0;
+  const auto now = millis();
+  if (now - last_display_update > display_refresh_rate)
+  {
+    last_display_update = now;
+    if (program.is_configurating())
+      display_configuration_screen();
+    else if (program.is_idle())
+    {
+      Lcd::move_cursor(Lcd::Line::Upper, 0);
+      Lcd::send_string(String("Panificadora    "));
+      Lcd::move_cursor(Lcd::Line::Lower, 0);
+      Lcd::send_string(String("BCC4004         "));
+    }
+    else if (program.is_running())
+    {
+      Lcd::move_cursor(Lcd::Line::Upper, 0);
+      Lcd::send_string(String("Time  Phase Temp"));
+
+      auto buffer = String("                  ");
+      prepend_formatted_minutes_to_lcd_string(buffer.begin(), stopwatch.get_remaining_minutes());
+      append_temperature_to_lcd_string(buffer.begin());
+
+      char phase_char;
+      switch (program.get_active_phase())
+      {
+      case Program::Phase::Kneading:
+        phase_char = 'S';
+        break;
+      case Program::Phase::Raising:
+        phase_char = 'C';
+        break;
+      case Program::Phase::Baking:
+        phase_char = 'A';
+        break;
+      }
+
+      buffer[8] = phase_char;
+
+      Lcd::move_cursor(Lcd::Line::Lower, 0);
+      Lcd::send_string(buffer);
+    }
+  }
+}
 
 void move_to_next_phase_to_configure()
 {
@@ -691,14 +884,49 @@ void move_to_next_phase_to_configure()
 
   switch (configuration_phase)
   {
-  case ProgramContext::Kneading:
-    configuration_phase = ProgramContext::Raising;
+  case Program::Kneading:
+    configuration_phase = Program::Raising;
     return;
-  case ProgramContext::Raising:
-    configuration_phase = ProgramContext::Baking;
+  case Program::Raising:
+    configuration_phase = Program::Baking;
     return;
   default:
-    configuration_phase = ProgramContext::Kneading;
+    configuration_phase = Program::Kneading;
+  }
+}
+
+void handle_configuration_mode_management()
+{
+  static unsigned long configuration_btn_pressed_at = 0;
+  static bool has_just_entered_configuration_mode = false;
+  const auto now = millis();
+
+  configuration_btn.check();
+  configuration_btn.time_state = now;
+
+  if (configuration_btn.has_changed() && configuration_btn.has_been_pressed())
+  {
+    if (program.is_idle())
+    {
+      program.begin_configuration();
+      configuration_phase = Program::Kneading;
+      has_just_entered_configuration_mode = true;
+    }
+    else if (program.is_configurating())
+    {
+      configuration_btn_pressed_at = now;
+    }
+  }
+  else if (configuration_btn.has_changed())
+  {
+    if (program.is_configurating() && !has_just_entered_configuration_mode)
+    {
+      const auto delta = now - configuration_btn_pressed_at;
+      const auto is_long_press = delta >= press_time_for_long_press;
+      is_long_press ? program.make_idle() : move_to_next_phase_to_configure();
+    }
+
+    has_just_entered_configuration_mode = false;
   }
 }
 
@@ -777,13 +1005,13 @@ void display_configuration_screen()
 
   switch (configuration_phase)
   {
-  case ProgramContext::Kneading:
+  case Program::Kneading:
     Lcd::send_string("sova    ");
     break;
-  case ProgramContext::Raising:
+  case Program::Raising:
     Lcd::send_string("cresc.  ");
     break;
-  case ProgramContext::Baking:
+  case Program::Baking:
     Lcd::send_string("assadura");
     break;
   }
