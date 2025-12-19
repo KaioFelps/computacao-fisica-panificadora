@@ -305,8 +305,8 @@ public:
     set_bit(*this->digital_input_disable_reg, this->analogic_channel);
   }
 
-  void turn_on() { this->resistance_pin_manager.set_digital_level(true); }
-  void turn_off() { this->resistance_pin_manager.set_digital_level(false); }
+  void turn_eletric_resistance_on() { this->resistance_pin_manager.set_digital_level(true); }
+  void turn_eletric_resistance_off() { this->resistance_pin_manager.set_digital_level(false); }
 
   void start_reading()
   {
@@ -327,62 +327,6 @@ public:
   }
 
   uint8_t get_temperature() { return this->temperature; }
-};
-
-class Program
-{
-public:
-  static const uint16_t MAX_TIME = 99 * 60 + 59;
-
-  enum Phase
-  {
-    Kneading = 0,
-    Baking = 1,
-    Raising = 2,
-  };
-
-  enum State
-  {
-    Idle,
-    Running,
-    Configurating,
-  };
-
-  bool is_running();
-  bool is_idle();
-  bool is_configurating();
-
-  void start();
-  void stop();
-
-  void begin_configuration();
-  void make_idle();
-
-  uint16_t get_phase_minutes(Phase phase) const;
-  void increment_phase_minutes(Phase phase, int16_t step);
-
-  Phase get_active_phase() const;
-  void start_next_phase();
-
-  /**
-   * Checa se um ciclo foi completado e imediatamente reseta a flag.
-   */
-  bool check_cycle_has_finished();
-
-private:
-  Phase current_phase = Phase::Kneading;
-  State current_state = State::Idle;
-  /**
-   * Tempo de cada etapa do processo Normal *em minutos*:
-   * 0: sova;
-   * 1: assadura; e
-   * 2: crescimento.
-   */
-  uint16_t phases_times[3] = {25, 90, 40};
-  /**
-   * Uma flag que indica se um ciclo terminou. Deve ser efêmera.
-   */
-  bool has_finished_a_cycle = false;
 };
 
 class Stopwatch
@@ -471,6 +415,74 @@ public:
   }
 };
 
+class Program
+{
+public:
+  static const uint16_t MAX_TIME = 99 * 60 + 59;
+
+  Program(Stopwatch stopwatch, TemperatureManager *temperature_manager, Motor *motor)
+      : stopwatch(stopwatch), temperature_manager(temperature_manager), motor(motor)
+  {
+  }
+
+  enum Phase
+  {
+    Kneading = 0,
+    Baking = 1,
+    Raising = 2,
+  };
+
+  enum State
+  {
+    Idle,
+    Running,
+    Configurating,
+  };
+
+  bool is_running();
+  bool is_idle();
+  bool is_configurating();
+
+  void start(unsigned long now);
+  void update(unsigned long now);
+  void stop();
+
+  void begin_configuration();
+
+  uint16_t get_phase_minutes(Phase phase) const;
+  void increment_phase_minutes(Phase phase, int16_t step);
+  uint32_t get_active_phase_remaining_minutes() const;
+  void handle_phase_change(unsigned long now);
+
+  Phase get_active_phase() const;
+
+  /**
+   * Checa se um ciclo foi completado e consome esta flag.
+   */
+  bool has_finished();
+
+private:
+  Stopwatch stopwatch;
+  TemperatureManager *temperature_manager;
+  Motor *motor;
+
+  Phase current_phase = Phase::Kneading;
+  State current_state = State::Idle;
+  /**
+   * Tempo de cada etapa do processo Normal *em minutos*:
+   * 0: sova;
+   * 1: assadura; e
+   * 2: crescimento.
+   */
+  uint16_t phases_times[3] = {25, 90, 40};
+  /**
+   * Uma flag que indica se um ciclo completo terminou. Deve ser efêmera.
+   */
+  bool cycle_has_been_finished = false;
+
+  void set_next_phase();
+};
+
 #pragma endregion
 #pragma region functions definitions
 
@@ -485,8 +497,6 @@ void prepend_formatted_minutes_to_lcd_string(char lcd_string[16], uint16_t minut
 #pragma endregion
 #pragma region main
 
-auto program = Program();
-
 auto power_btn = Button(PinManager(PC2, &PINC, &PORTC, &DDRC));
 auto configuration_btn = Button(PinManager(PC3, &PINC, &PORTC, &DDRC));
 auto increment_btn = Button(PinManager(PC5, &PINC, &PORTC, &DDRC));
@@ -495,11 +505,11 @@ auto decrement_btn = Button(PinManager(PC4, &PINC, &PORTC, &DDRC));
 auto buzzer = Buzzer(A1, 300);
 auto motor = Motor(PinManager(PD2, &PIND, &PORTD, &DDRD));
 auto temp_manager = TemperatureManager(PinManager(PD3, &PIND, &PORTD, &DDRD), A0, &DIDR0);
-auto stopwatch = Stopwatch();
+
+auto program = Program(Stopwatch(), &temp_manager, &motor);
 
 void setup()
 {
-  Serial.begin(9600);
   Lcd::begin();
   Lcd::turn_cursor_off();
 
@@ -572,33 +582,39 @@ void loop()
 {
   auto now = millis();
 
-  ////////////////////////////////////////////////////////////////////////////////////
-  // Entrando no modo de configuração
-  //
-  // - 1 clique em repouso: entra no modo de configuração;
-  // - 1 clique curto no modo de configuração: altera a fase a ser configurada;
-  // - 1 clique longo no modo de configuração: sai do modo de configuração.
-  ////////////////////////////////////////////////////////////////////////////////////
-  if (now - configuration_btn.time_state > buttons_rate) handle_configuration_mode_management();
-
-  ////////////////////////////////////////////////////////////////////////////////////
-  // Configuração do tempo de cada fase.
-  // Cliques longos aumentam/diminuem de 5 em 5 a cada meio segundo até serem soltos.
-  ////////////////////////////////////////////////////////////////////////////////////
-  if (program.is_configurating()) handle_configuration();
-
-  if (program.is_idle() && now - power_btn.time_state > buttons_rate)
+  if (now - power_btn.time_state > buttons_rate)
   {
     power_btn.check();
     power_btn.time_state = now;
     if (power_btn.has_changed() && power_btn.has_been_pressed())
     {
-      program.start();
+      // Inicia o programa mesmo se estiver na tela de configuração
+      program.is_running() ? program.stop() : program.start(now);
     }
   }
 
+  /* Entrando no modo de configuração
+   *
+   * - 1 clique em repouso: entra no modo de configuração;
+   * - 1 clique curto no modo de configuração: altera a fase a ser configurada;
+   * - 1 clique longo no modo de configuração: sai do modo de configuração.
+   */
+  if (now - configuration_btn.time_state > buttons_rate) handle_configuration_mode_management();
+
+  /*
+   * Configuração do tempo de cada fase.
+   * Cliques longos aumentam/diminuem de 5 em 5 a cada meio segundo até serem soltos.
+   */
+  if (program.is_configurating()) handle_configuration();
+
   if (program.is_running())
   {
+    /*
+     * Atualiza o estado interno do programa, verificando o tempo e
+     * realizando as operações de acordo com o esperado dado a fase corrente.
+     */
+    program.update(now);
+
     static unsigned long update_temperature_time_state = 0;
     if (now - update_temperature_time_state > temperature_read_refresh_rate)
     {
@@ -606,38 +622,10 @@ void loop()
       temp_manager.start_reading();
     }
 
-    if (stopwatch.is_idle())
-    {
-      const auto phase_minutes = program.get_phase_minutes(program.get_active_phase());
-      Serial.print("Começando a contar minutos ");
-      Serial.println(phase_minutes);
-      stopwatch.set_timer(phase_minutes);
-      stopwatch.start(now);
-    }
-
-    if (stopwatch.is_finished())
-    {
-      stopwatch.stop();
-      program.start_next_phase();
-      // TODO
-      // handle_program_phase_begin();
-    }
-
-    static unsigned long stopwatch_check_time_state = 0;
-    if (stopwatch.is_running() && now - stopwatch_check_time_state > stopwatch_check_refresh_rate)
-    {
-      stopwatch_check_time_state = now;
-      stopwatch.calculate_current_time(now);
-      Serial.println(stopwatch.get_remaining_minutes());
-    }
-
-    if (program.check_cycle_has_finished())
-    {
-      buzzer.start(now, buzzer_duration);
-      Serial.println("tocar buzzer");
-    }
+    if (program.has_finished()) buzzer.start(now, buzzer_duration);
   }
 
+  // verifica se o buzzer já tocou pelo tempo esperado e, então, o para
   buzzer.update(now);
   update_lcd_display();
 }
@@ -791,16 +779,62 @@ bool Program::is_running() { return this->current_state == State::Running; }
 bool Program::is_idle() { return this->current_state == State::Idle; }
 bool Program::is_configurating() { return this->current_state == State::Configurating; }
 
-void Program::start()
+void Program::start(unsigned long now)
 {
   this->current_state = State::Running;
   this->current_phase = Phase::Kneading;
+  this->handle_phase_change(now);
+}
+
+void Program::update(unsigned long now)
+{
+  // A leitura do término de ciclo deve ser lida antes da próxima atualização.
+  // Esse reset garante que a flag de término de ciclo seja efêmera; disponível
+  // somente no ciclo em que terminou.
+  this->cycle_has_been_finished = false;
+  if (!this->is_running()) return;
+
+  this->stopwatch.calculate_current_time(now);
+  if (!this->stopwatch.is_finished()) return;
+
+  this->stopwatch.stop();
+  this->set_next_phase();
+  this->handle_phase_change(now);
+}
+
+void Program::handle_phase_change(unsigned long now)
+{
+  const auto phase_minutes = this->phases_times[this->current_phase];
+  if (this->stopwatch.is_running()) this->stopwatch.stop();
+
+  // Lê silenciosamente sem consumir a flag, permitindo
+  // que outros códigos rodem com base nessa flag no loop principal.
+  if (this->cycle_has_been_finished)
+  {
+    this->stop();
+    return;
+  }
+
+  this->stopwatch.set_timer(phase_minutes);
+  this->stopwatch.start(now);
+
+  switch (this->current_phase)
+  {
+  case Program::Phase::Kneading:
+    this->motor->turn_on();
+    break;
+  case Program::Phase::Raising:
+    this->motor->turn_off();
+    break;
+  case Program::Phase::Baking:
+    this->temperature_manager->turn_eletric_resistance_on();
+    break;
+  }
 }
 
 Program::Phase Program::get_active_phase() const { return this->current_phase; }
 
 void Program::begin_configuration() { this->current_state = State::Configurating; }
-void Program::make_idle() { this->current_state = State::Idle; }
 
 uint16_t Program::get_phase_minutes(Phase phase) const { return this->phases_times[phase]; }
 void Program::increment_phase_minutes(Phase phase, int16_t step = 1)
@@ -811,32 +845,43 @@ void Program::increment_phase_minutes(Phase phase, int16_t step = 1)
   this->phases_times[phase] = new_value;
 }
 
-void Program::start_next_phase()
+void Program::set_next_phase()
 {
   if (!this->is_running()) return;
+
   switch (this->current_phase)
   {
   case Phase::Kneading:
     this->current_phase = Phase::Raising;
-    return;
+    break;
   case Phase::Raising:
     this->current_phase = Phase::Baking;
-    return;
+    break;
   case Phase::Baking:
-    this->stop();
-    this->has_finished_a_cycle = true;
-    return;
+    this->cycle_has_been_finished = true;
+    break;
   }
 }
 
-bool Program::check_cycle_has_finished()
+bool Program::has_finished()
 {
-  const auto has_finished = this->has_finished_a_cycle;
-  this->has_finished_a_cycle = false;
+  const auto has_finished = this->cycle_has_been_finished;
+  this->cycle_has_been_finished = false;
   return has_finished;
 }
 
-void Program::stop() { this->current_state = State::Idle; }
+void Program::stop()
+{
+  this->current_state = State::Idle;
+  this->stopwatch.stop();
+  this->motor->turn_off();
+  this->temperature_manager->turn_eletric_resistance_off();
+}
+
+uint32_t Program::get_active_phase_remaining_minutes() const
+{
+  return this->stopwatch.get_remaining_minutes();
+}
 
 #pragma endregion
 #pragma region functions implementations
@@ -862,9 +907,8 @@ void update_lcd_display()
       Lcd::move_cursor(Lcd::Line::Upper, 0);
       Lcd::send_string(String("Time  Phase Temp"));
 
-      auto buffer = String("                  ");
-      prepend_formatted_minutes_to_lcd_string(buffer.begin(), stopwatch.get_remaining_minutes());
-      append_temperature_to_lcd_string(buffer.begin());
+      char buffer[17] = "                ";
+      const auto minutes = program.get_active_phase_remaining_minutes();
 
       char phase_char;
       switch (program.get_active_phase())
@@ -881,6 +925,8 @@ void update_lcd_display()
       }
 
       buffer[8] = phase_char;
+      prepend_formatted_minutes_to_lcd_string(buffer, minutes);
+      append_temperature_to_lcd_string(buffer);
 
       Lcd::move_cursor(Lcd::Line::Lower, 0);
       Lcd::send_string(buffer);
@@ -933,7 +979,7 @@ void handle_configuration_mode_management()
     {
       const auto delta = now - configuration_btn_pressed_at;
       const auto is_long_press = delta >= press_time_for_long_press;
-      is_long_press ? program.make_idle() : move_to_next_phase_to_configure();
+      is_long_press ? program.stop() : move_to_next_phase_to_configure();
     }
 
     has_just_entered_configuration_mode = false;
@@ -1026,9 +1072,9 @@ void display_configuration_screen()
     break;
   }
 
-  auto buffer = String("                ");
+  char buffer[17] = "                ";
   const auto minutes = program.get_phase_minutes(configuration_phase);
-  prepend_formatted_minutes_to_lcd_string(buffer.begin(), minutes);
+  prepend_formatted_minutes_to_lcd_string(buffer, minutes);
 
   Lcd::move_cursor(Lcd::Line::Lower, 0);
   Lcd::send_string(buffer);
@@ -1053,7 +1099,7 @@ void append_temperature_to_lcd_string(char lcd_string[16])
 {
   auto offset = 15;
   auto temperature = temp_manager.get_temperature();
-  const auto degree_mark_character = 0;
+  const auto degree_mark_character = 8;
 
   lcd_string[offset--] = degree_mark_character;
 
