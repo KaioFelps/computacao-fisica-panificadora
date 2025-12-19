@@ -399,17 +399,22 @@ private:
    * O millis exato em que o cronômetro começou a contar (por ser iniciado ou
    * despausado).
    */
-  unsigned long timer_begin_millis_print = 0;
+  unsigned long timer_begin_millis_stamp = 0;
   /**
    * A quantidade de tempo que o cronômetro deve marcar.
    */
   unsigned long goal = 0;
   uint16_t remaining_minutes = 0;
   State state = State::Idle;
+  unsigned long refresh_rate_ms = 300;
+  /**
+   * Usado para aplicar um debounce internamente.
+   */
+  unsigned long time_state = 0;
 
   void clean()
   {
-    this->timer_begin_millis_print = 0;
+    this->timer_begin_millis_stamp = 0;
     this->goal = 0;
   }
 
@@ -420,6 +425,9 @@ private:
   }
 
 public:
+  Stopwatch() = default;
+  Stopwatch(unsigned long refresh_rate_ms) : refresh_rate_ms(refresh_rate_ms) {}
+
   bool is_finished() const { return this->state == State::Finished; }
 
   bool is_running() const { return this->state == State::Running; }
@@ -432,10 +440,10 @@ public:
 
   void set_timer(uint16_t minutes) { this->goal = (unsigned long)minutes * 60 * 1000; }
 
-  void start(unsigned long begin_millis_print)
+  void start(unsigned long begin_ms)
   {
     this->state = State::Running;
-    this->timer_begin_millis_print = begin_millis_print;
+    this->timer_begin_millis_stamp = begin_ms;
     this->remaining_minutes = 0;
   }
 
@@ -448,8 +456,10 @@ public:
   void calculate_current_time(unsigned long now)
   {
     if (this->state != State::Running) return;
+    if (now - this->time_state <= this->refresh_rate_ms) return;
 
-    const auto run_millis = now - this->timer_begin_millis_print;
+    this->time_state = now;
+    const auto run_millis = now - this->timer_begin_millis_stamp;
     const auto remaining_millis = run_millis > this->goal ? 0 : this->goal - run_millis;
 
     if (remaining_millis == 0) this->finish();
